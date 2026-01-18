@@ -44,6 +44,7 @@ from statsmodels.tsa.api import VAR
 from statsmodels.tsa.vector_ar.vecm import VECM, coint_johansen
 from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.tsa.ardl import ARDL, ardl_select_order
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 # Optional (bounds test exists only in some statsmodels versions)
 try:
@@ -182,6 +183,22 @@ def _read_uploaded_file(uploaded) -> Tuple[pd.DataFrame, Dict[str, str]]:
     return df, meta
 
 
+
+
+def _data_audit_table(raw_df: pd.DataFrame, used_df: pd.DataFrame, context: str, extra: dict | None = None) -> pd.DataFrame:
+    extra = extra or {}
+    raw_n = int(len(raw_df))
+    used_n = int(len(used_df))
+    dropped = raw_n - used_n
+    rows = [
+        {"context": context, "metric": "rows_raw", "value": raw_n},
+        {"context": context, "metric": "rows_used", "value": used_n},
+        {"context": context, "metric": "rows_dropped", "value": dropped},
+    ]
+    for k, v in extra.items():
+        rows.append({"context": context, "metric": str(k), "value": v})
+    return pd.DataFrame(rows)
+
 def _df_to_html(df: pd.DataFrame, max_rows: int = 200) -> str:
     if df is None:
         return "<div class='table-wrap'><em>None</em></div>"
@@ -242,6 +259,25 @@ def _line_plot(df: pd.DataFrame, title: str) -> None:
     ax.legend(loc="upper left", ncol=3, fontsize=9, frameon=False)
     _fig_show(fig)
 
+
+
+def _plot_acf_pacf(series: pd.Series, lags: int, title_prefix: str) -> None:
+    series = pd.Series(series).dropna()
+    if len(series) < 10:
+        st.info("Not enough observations for ACF/PACF.")
+        return
+    fig1 = plot_acf(series.values, lags=min(lags, max(1, len(series)//2 - 1)), title=f"{title_prefix} ACF")
+    _fig_show(fig1.figure)
+    fig2 = plot_pacf(series.values, lags=min(lags, max(1, len(series)//2 - 1)), title=f"{title_prefix} PACF", method="ywm")
+    _fig_show(fig2.figure)
+
+
+def _plot_residual_acf(resid: pd.Series, lags: int, title_prefix: str) -> None:
+    resid = pd.Series(resid).dropna()
+    if len(resid) < 10:
+        return
+    fig = plot_acf(resid.values, lags=min(lags, max(1, len(resid)//2 - 1)), title=f"{title_prefix} Residual ACF")
+    _fig_show(fig.figure)
 
 # ============================================================
 # TRANSFORMATION SCREENING
@@ -378,10 +414,13 @@ def _panel_prepare(
     X = X.loc[keep]
 
     meta = {
-        "n_obs": str(len(y)),
+        "n_rows_input_subset": str(len(df_raw[[id_col, time_col, y_col] + x_cols])),
+        "n_rows_after_dropna_y": str(len(df.dropna(subset=[y_col]))),
+        "n_obs_used": str(len(y)),
         "n_entities": str(y.index.get_level_values(0).nunique()),
         "time_min": str(y.index.get_level_values(1).min()),
         "time_max": str(y.index.get_level_values(1).max()),
+        "n_regressors_including_const": str(X.shape[1]),
     }
     meta.update({f"transform_{k}": v for k, v in tr_notes.items()})
     return df, y, X, meta
@@ -612,7 +651,8 @@ def _ts_prepare(df_raw: pd.DataFrame, year_col: str, vars_: List[str], transform
     df = df.dropna(subset=vars_)
 
     meta = {
-        "T": str(len(df)),
+        "n_rows_input_subset": str(len(df_raw[[year_col] + vars_])),
+        "T_used": str(len(df)),
         "year_min": str(int(df.index.min())) if len(df) else "",
         "year_max": str(int(df.index.max())) if len(df) else "",
     }
@@ -776,6 +816,127 @@ def _ardl_ecm(ardl_res, ts_df: pd.DataFrame, y: str, x_list: List[str], adf_reg:
     return res, lr_table, ect
 
 
+
+
+def _ardl_structure_report(ardl_res, y: str, x_list: List[str]) -> tuple[bool, pd.DataFrame, int, Dict[str, int]]:
+    """Validate detected lag structure from ARDL param names.
+
+    Returns:
+      ok: True only if we can detect a contiguous lag structure for y (1..p) and each x (0..q).
+      report: per-variable found/missing lags
+      p: detected max lag for y
+      q_map: detected max lag for each x
+
+    Rationale: If we cannot parse lags reliably, do not output long-run/ECM numbers.
+    """
+    params = ardl_res.params
+    names = list(params.index)
+    m = _parse_ardl_terms(names)
+
+    p = max([lag for lag in m.get(y, {}).keys() if lag >= 1], default=0)
+    q_map = {x: max([lag for lag in m.get(x, {}).keys() if lag >= 0], default=-1) for x in x_list}
+
+    rows = []
+    ok = True
+
+    # y lags should cover 1..p if p>0
+    y_found = sorted([lag for lag in m.get(y, {}).keys() if lag >= 1])
+    y_missing = [lag for lag in range(1, p + 1) if lag not in y_found]
+    if p == 0 or y_missing:
+        ok = False
+    rows.append({"variable": y, "role": "Y", "max_lag": p, "found_lags": str(y_found), "missing_lags": str(y_missing)})
+
+    for x in x_list:
+        q = q_map.get(x, -1)
+        x_found = sorted([lag for lag in m.get(x, {}).keys() if lag >= 0])
+        x_missing = [lag for lag in range(0, q + 1) if lag not in x_found] if q >= 0 else [0]
+        if q < 0 or x_missing:
+            ok = False
+        rows.append({"variable": x, "role": "X", "max_lag": q if q >= 0 else np.nan, "found_lags": str(x_found), "missing_lags": str(x_missing)})
+
+    return ok, pd.DataFrame(rows), p, q_map
+
+
+def _ardl_long_run_checked(ardl_res, y: str, x_list: List[str]) -> tuple[Optional[pd.DataFrame], Optional[float]]:
+    """Compute long-run coefficients only if lag parsing is reliable."""
+    ok, rep, p, q_map = _ardl_structure_report(ardl_res, y=y, x_list=x_list)
+    if not ok:
+        return None, None
+
+    params = ardl_res.params
+    names = list(params.index)
+    m = _parse_ardl_terms(names)
+
+    phi = 0.0
+    for lag, nm in m.get(y, {}).items():
+        if lag >= 1:
+            phi += float(params[nm])
+    denom = 1.0 - phi
+    if denom == 0:
+        return None, None
+
+    const = float(params.get('const', params.get('intercept', 0.0)))
+    const_lr = const / denom
+
+    rows = []
+    for x in x_list:
+        betas = 0.0
+        for lag, nm in m.get(x, {}).items():
+            if lag >= 0:
+                betas += float(params[nm])
+        rows.append({"variable": x, "sum_beta_lags": betas, "long_run_coef": betas / denom, "max_lag_included": q_map.get(x, np.nan)})
+
+    return pd.DataFrame(rows), const_lr
+
+
+
+def _ardl_ecm_checked(ardl_res, ts_df: pd.DataFrame, y: str, x_list: List[str]) -> Optional[sm.regression.linear_model.RegressionResultsWrapper]:
+    """Estimate ECM only if ARDL lag parsing is reliable."""
+    ok, rep_df, p, q_map = _ardl_structure_report(ardl_res, y=y, x_list=x_list)
+    if not ok:
+        return None
+
+    lr_tbl, const_lr = _ardl_long_run_checked(ardl_res, y=y, x_list=x_list)
+    if lr_tbl is None or const_lr is None:
+        return None
+
+    lr_map = {r['variable']: float(r['long_run_coef']) for _, r in lr_tbl.iterrows()}
+
+    df = ts_df[[y] + x_list].copy().astype(float)
+    ect = df[y].shift(1) - const_lr
+    for x in x_list:
+        ect = ect - lr_map.get(x, float('nan')) * df[x].shift(1)
+
+    dy = df[y].diff()
+    reg = pd.DataFrame({'dy': dy, 'ect_l1': ect})
+
+    for i in range(1, max(p, 1)):
+        reg[f'd{y}_L{i}'] = dy.shift(i)
+
+    for x in x_list:
+        dx = df[x].diff()
+        for j in range(0, int(q_map.get(x, 0)) + 1):
+            reg[f'd{x}_L{j}'] = dx.shift(j)
+
+    reg = reg.dropna()
+    if len(reg) < 10:
+        return None
+
+    Y = reg['dy']
+    X = sm.add_constant(reg.drop(columns=['dy']), has_constant='add')
+
+    mod = sm.OLS(Y.values, X.values)
+    try:
+        res = mod.fit(cov_type='HAC', cov_kwds={'maxlags': 1})
+    except Exception:
+        res = mod.fit()
+
+    tab = pd.DataFrame({'term': ['const'] + list(X.columns[1:]), 'coef': res.params, 'std_err': res.bse, 't': res.tvalues, 'p': res.pvalues})
+    res.ecm_table_ = tab  # type: ignore
+    res.ecm_lr_table_ = lr_tbl  # type: ignore
+    res.ecm_structure_ = rep_df  # type: ignore
+    return res
+
 def _engle_granger_resid_coint(df: pd.DataFrame, y: str, x_list: List[str], trend: str = "c") -> Dict[str, float]:
     Y = df[y].astype(float)
     X = df[x_list].astype(float)
@@ -789,6 +950,47 @@ def _engle_granger_resid_coint(df: pd.DataFrame, y: str, x_list: List[str], tren
     return {"eg_adf_p_resid": p}
 
 
+
+
+def _pick_selected_lag_from_sel(sel, criterion: str) -> int:
+    """Robustly obtain selected lag from statsmodels VARSelectOrderResults."""
+    # Newer versions
+    so = getattr(sel, 'selected_orders', None)
+    if isinstance(so, dict) and criterion in so and so[criterion] is not None:
+        try:
+            return int(so[criterion])
+        except Exception:
+            pass
+    # Fallback: sel.<criterion> sometimes returns an int
+    v = getattr(sel, criterion, None)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    # Fallback: choose argmin from table
+    tbl = _var_lag_table(sel)
+    if {'criterion','lag','value'}.issubset(tbl.columns):
+        sub = tbl[tbl['criterion'] == criterion].copy()
+        if len(sub):
+            return int(sub.loc[sub['value'].astype(float).idxmin(), 'lag'])
+    raise ValueError('Unable to determine selected lag from VAR selection result.')
+
+
+def _suggest_vecm_k_ar_diff(data_levels: pd.DataFrame, maxlags: int, criterion: str, trend: str) -> tuple[int, pd.DataFrame]:
+    """Suggest k_ar_diff using VAR lag selection on differenced data.
+
+    VECM(k_ar_diff) corresponds to VAR(p) in levels with p = k_ar_diff + 1.
+    We approximate p via VAR selection on differenced data and map to k_ar_diff.
+    """
+    d = data_levels.diff().dropna()
+    if len(d) < 10:
+        return 1, pd.DataFrame({'note':['Insufficient observations for lag selection. Using k_ar_diff=1.']})
+    sel = VAR(d).select_order(maxlags=maxlags, trend=trend)
+    tbl = _var_lag_table(sel)
+    try:
+        p = _pick_selected_lag_from_sel(sel, criterion)
+    except Exception:
+        p = max(2, min(2, maxlags))
+    k = max(1, int(p) - 1)
+    return k, tbl
 def _var_lag_table(sel) -> pd.DataFrame:
     """Create a defensible lag selection table from VAR select_order result."""
     rows = []
@@ -955,7 +1157,7 @@ if mode == "Panel data":
     df_raw, meta_file = _read_uploaded_file(uploaded)
 
     with st.expander("Data preview", expanded=True):
-        st.dataframe(df_raw.head(25), use_container_width=True)
+        st_table(df_raw.head(25), caption="Preview (first 25 rows)")
 
     cols = df_raw.columns.tolist()
     if len(cols) < 4:
@@ -1023,6 +1225,12 @@ if mode == "Panel data":
     st.subheader("Run")
     run = st.button("Estimate panel models", type="primary")
     if not run:
+        if "panel_export_bytes" in st.session_state and "panel_export_name" in st.session_state:
+            st.info("No re-estimation executed. You can download the last panel report below, or click Estimate panel models to recompute.")
+            xbytes = st.session_state["panel_export_bytes"]
+            name = st.session_state["panel_export_name"]
+            is_zip = xbytes[:2] == b"PK"
+            st.download_button("Download last panel report", data=xbytes, file_name=name, mime=("application/zip" if is_zip else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
         st.stop()
 
     df_panel, y, X, meta_prep = _panel_prepare(
@@ -1035,6 +1243,13 @@ if mode == "Panel data":
         transform_map=transform_map,
     )
 
+
+    st.download_button(
+        "Download cleaned panel dataset (CSV)",
+        data=pd.concat([y.rename(y_col), X], axis=1).reset_index().to_csv(index=False).encode('utf-8'),
+        file_name='panel_cleaned.csv',
+        mime='text/csv',
+    )
     # Covariance mapping
     cov_kwargs = {}
     cov_type = "unadjusted"
@@ -1260,7 +1475,12 @@ if mode == "Panel data":
         })
         return out
 
+    panel_used = pd.concat([y.rename("y"), X], axis=1).reset_index()
+    panel_audit = _data_audit_table(df_raw, panel_used, context="panel", extra={"n_entities": y.index.get_level_values(0).nunique(), "n_time": y.index.get_level_values(1).nunique(), "n_X_cols": X.shape[1]})
+
     export_tables: Dict[str, pd.DataFrame] = {
+        "panel_data_audit": panel_audit,
+        "panel_clean_head": panel_used.head(200),
         "panel_selection": sel_df,
         "panel_screening": screen_df,
         "panel_vif": vif_df,
@@ -1285,6 +1505,8 @@ if mode == "Panel data":
     }
 
     xbytes = _excel_bytes(export_tables, notes=config)
+    st.session_state["panel_export_bytes"] = xbytes
+    st.session_state["panel_export_name"] = ("panel_report.zip" if xbytes[:2]==b"PK" else "panel_report.xlsx")
 
     # Decide mime based on whether it looks like zip
     is_zip = xbytes[:2] == b"PK"
@@ -1312,7 +1534,7 @@ else:
     df_raw, meta_file = _read_uploaded_file(uploaded)
 
     with st.expander("Data preview", expanded=True):
-        st.dataframe(df_raw.head(25), use_container_width=True)
+        st_table(df_raw.head(25), caption="Preview (first 25 rows)")
 
     cols = df_raw.columns.tolist()
     default_year = "year" if "year" in cols else cols[0]
@@ -1362,8 +1584,20 @@ else:
     with m3:
         st.metric("Year max", meta_prep.get("year_max", ""))
 
+    st.download_button(
+        "Download cleaned TS dataset (CSV)",
+        data=ts_df.reset_index().to_csv(index=False).encode('utf-8'),
+        file_name='ts_cleaned.csv',
+        mime='text/csv',
+    )
+
     st.subheader("Plots: levels")
     _line_plot(ts_df[vars_], title="Time series (levels)")
+
+    st.subheader('ACF/PACF (selected variable)')
+    acf_var = st.selectbox('Choose variable for ACF/PACF', vars_, index=0, key='acf_var')
+    acf_lags = st.slider('Number of lags (ACF/PACF)', 5, 20, 12, key='acf_lags')
+    _plot_acf_pacf(ts_df[acf_var], lags=acf_lags, title_prefix=f'{acf_var} (levels)')
 
     st.subheader("Stationarity screening")
     adf_reg = st.selectbox("ADF deterministic term", ["c", "ct"], index=0)
@@ -1419,6 +1653,12 @@ else:
 
         run = st.button("Fit VAR", type="primary")
         if not run:
+            if 'ts_export_bytes' in st.session_state and 'ts_export_name' in st.session_state:
+                st.info('No re-fit executed. You can download the last TS report below, or click Fit VAR to recompute.')
+                xbytes = st.session_state['ts_export_bytes']
+                name = st.session_state['ts_export_name']
+                is_zip = xbytes[:2] == b'PK'
+                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=('application/zip' if is_zip else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
             st.stop()
 
         data = ts_df[endog].copy()
@@ -1472,7 +1712,12 @@ else:
                 params["equation"] = eqn
                 coef_tables.append(params)
 
+            ts_used = (data.reset_index().rename(columns={"index":"year"}) if hasattr(data, "reset_index") else pd.DataFrame())
+            ts_audit = _data_audit_table(df_raw, ts_df.reset_index(), context="ts", extra={"T_used": T, "transforms": str({k:v for k,v in transform_map.items() if v!="none"})})
+
             export = {
+                "ts_data_audit": ts_audit,
+                "ts_clean_head": ts_df.reset_index().head(200),
                 "ts_screening": screen_df,
                 "ts_stationarity": stat_df,
                 "ts_integration": integ_df,
@@ -1484,6 +1729,8 @@ else:
 
             config = {**base_config, "model": "VAR", "endog": ",".join(endog), "selected_lag": str(lag), "trend": trend, "ic": ic, "data_mode": data_mode}
             xbytes = _excel_bytes(export, notes=config)
+            st.session_state["ts_export_bytes"] = xbytes
+            st.session_state["ts_export_name"] = ("ts_report_VAR.zip" if xbytes[:2]==b"PK" else "ts_report_VAR.xlsx")
             is_zip = xbytes[:2] == b"PK"
 
             st.download_button(
@@ -1516,17 +1763,33 @@ else:
             st_table(not_i1)
             st.stop()
 
-        default_k = 1
-        k_ar_diff = st.slider("Lag in differences (k_ar_diff)", 1, min(6, max(1, T // 8)), default_k)
+        max_k = min(6, max(1, T // 8))
+        lag_mode = st.radio("Lag selection for VECM (k_ar_diff)", ["Auto (BIC)", "Manual"], horizontal=True)
+        maxlags_sel = st.slider("Max lag to consider (proxy via VAR on differences)", 1, min(8, max(2, T // 5)), min(4, max(2, T // 10)))
         det = st.selectbox(
+
             "Deterministic term",
             ["nc", "co", "ct"],
             index=1,
             help="nc: none, co: constant in cointegration relation, ct: constant + trend in cointegration relation",
         )
 
+        if lag_mode.startswith('Auto'):
+            k_sug, lag_tbl = _suggest_vecm_k_ar_diff(ts_df[endog].copy(), maxlags=maxlags_sel, criterion='bic', trend='c')
+            st.markdown('**Lag selection table (proxy; VAR on first differences)**')
+            st_table(lag_tbl)
+            k_ar_diff = st.number_input('k_ar_diff (suggested; you can override)', min_value=1, max_value=int(max_k), value=int(min(k_sug, max_k)))
+        else:
+            k_ar_diff = st.slider('Lag in differences (k_ar_diff)', 1, int(max_k), 1)
+
         run = st.button("Fit VECM", type="primary")
         if not run:
+            if 'ts_export_bytes' in st.session_state and 'ts_export_name' in st.session_state:
+                st.info('No re-fit executed. You can download the last TS report below, or click Fit VECM to recompute.')
+                xbytes = st.session_state['ts_export_bytes']
+                name = st.session_state['ts_export_name']
+                is_zip = xbytes[:2] == b'PK'
+                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=('application/zip' if is_zip else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
             st.stop()
 
         data = ts_df[endog].copy()
@@ -1548,6 +1811,19 @@ else:
 
             st.subheader("Johansen cointegration test (trace)")
             st_table(jtab)
+
+            # Max-eigen table
+            maxeig = joh.lr2
+            cvm_5 = joh.cvm[:, 1]
+            jtab2 = pd.DataFrame({
+                'rank': list(range(len(maxeig))),
+                'max_eig_stat': maxeig,
+                'cv_5pct': cvm_5,
+                'reject_H0_rank_eq_r_at_5pct': (maxeig > cvm_5),
+            })
+            st.markdown('**Johansen max-eigen test (5%)**')
+            st_table(jtab2)
+
             st.markdown(f"**Selected rank (5%)** = {rank}")
 
             if rank == 0:
@@ -1600,11 +1876,17 @@ else:
                 pass
             st_table(pd.DataFrame(diag_rows))
 
+            ts_used = (data.reset_index().rename(columns={"index":"year"}) if hasattr(data, "reset_index") else pd.DataFrame())
+            ts_audit = _data_audit_table(df_raw, ts_df.reset_index(), context="ts", extra={"T_used": T, "transforms": str({k:v for k,v in transform_map.items() if v!="none"})})
+
             export = {
+                "ts_data_audit": ts_audit,
+                "ts_clean_head": ts_df.reset_index().head(200),
                 "ts_screening": screen_df,
                 "ts_stationarity": stat_df,
                 "ts_integration": integ_df,
                 "johansen_trace": jtab,
+                "johansen_maxeig": jtab2,
                 "alpha": alpha.reset_index().rename(columns={"index": "variable"}) if not alpha.empty else pd.DataFrame(),
                 "beta": beta.reset_index().rename(columns={"index": "variable"}) if not beta.empty else pd.DataFrame(),
                 "vecm_causality_p": caus_df,
@@ -1613,6 +1895,8 @@ else:
 
             config = {**base_config, "model": "VECM", "endog": ",".join(endog), "k_ar_diff": str(k_ar_diff), "deterministic": det, "rank": str(rank)}
             xbytes = _excel_bytes(export, notes=config)
+            st.session_state["ts_export_bytes"] = xbytes
+            st.session_state["ts_export_name"] = ("ts_report_VECM.zip" if xbytes[:2]==b"PK" else "ts_report_VECM.xlsx")
             is_zip = xbytes[:2] == b"PK"
 
             st.download_button(
@@ -1647,6 +1931,12 @@ else:
 
         run = st.button("Fit ARDL", type="primary")
         if not run:
+            if 'ts_export_bytes' in st.session_state and 'ts_export_name' in st.session_state:
+                st.info('No re-fit executed. You can download the last TS report below, or click Fit ARDL to recompute.')
+                xbytes = st.session_state['ts_export_bytes']
+                name = st.session_state['ts_export_name']
+                is_zip = xbytes[:2] == b'PK'
+                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=('application/zip' if is_zip else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
             st.stop()
 
         data_y = ts_df[y_name].astype(float)
@@ -1666,6 +1956,7 @@ else:
             # Cointegration (Bounds test if available; else honest fallback)
             st.subheader("Cointegration test")
             coint_rows = []
+            allow_eg = st.checkbox("Use Engle–Granger fallback (indicative only)", value=False)
             bounds_available = ardl_bonds_test is not None
             if bounds_available:
                 try:
@@ -1677,32 +1968,40 @@ else:
                     st.warning(f"Bounds test not usable in this environment: {e}")
 
             if not bounds_available:
-                st.info("Bounds test is not available in this statsmodels environment. Showing Engle–Granger residual-based test as indicative only.")
-                eg = _engle_granger_resid_coint(ts_df[[y_name] + x_list], y=y_name, x_list=x_list, trend=trend)
-                coint_rows.append({"test": "Engle–Granger (indicative)", "stat": np.nan, "p_value": eg.get("eg_adf_p_resid", np.nan)})
+                # Strict: do not claim bounds-based cointegration if not available
+                coint_rows.append({"test": "Bounds test unavailable", "stat": np.nan, "p_value": np.nan})
+                if allow_eg:
+                    eg = _engle_granger_resid_coint(ts_df[[y_name] + x_list], y=y_name, x_list=x_list, trend=trend)
+                    coint_rows.append({"test": "Engle–Granger (indicative)", "stat": np.nan, "p_value": eg.get("eg_adf_p_resid", np.nan)})
 
             st_table(pd.DataFrame(coint_rows))
-
             st.subheader("Long-run & ECM")
-            lr_tbl, const_lr, p_est = _ardl_long_run(ardl_res, y=y_name, x_list=x_list)
-            st_table(lr_tbl)
 
-            ecm_res, lr_tbl2, ect_series = _ardl_ecm(ardl_res, ts_df, y=y_name, x_list=x_list, adf_reg=adf_reg, kpss_reg=kpss_reg)
-            if ecm_res is None:
-                st.warning("ECM could not be estimated reliably (insufficient aligned observations).")
+            ok_struct, struct_df, p_det, q_map = _ardl_structure_report(ardl_res, y=y_name, x_list=x_list)
+            st.markdown("**ARDL lag structure parsing (validation)**")
+            st_table(struct_df)
+
+            lr_checked, const_lr = _ardl_long_run_checked(ardl_res, y=y_name, x_list=x_list)
+            if (not ok_struct) or (lr_checked is None) or (const_lr is None):
+                st.error("Long-run/ECM blocked: ARDL lag terms could not be parsed reliably. This prevents accidental wrong long-run/ECM outputs.")
             else:
-                # highlight ect term
-                ecm_tab = getattr(ecm_res, "ecm_table_", pd.DataFrame())
-                st_table(ecm_tab)
-                try:
-                    ect_row = ecm_tab[ecm_tab["term"] == "ect_l1"].iloc[0]
-                    st.markdown(
-                        f"<div class='card'><h3>Speed of adjustment (ECT)</h3><p>ECT coefficient (expected negative if stable): <b>{ect_row['coef']:.4g}</b>, p-value: <b>{ect_row['p']:.4g}</b></p></div>",
-                        unsafe_allow_html=True,
-                    )
-                except Exception:
-                    pass
+                st.markdown("**Long-run coefficients (only when parsing is reliable)**")
+                st_table(lr_checked)
 
+                ecm_res = _ardl_ecm_checked(ardl_res, ts_df, y=y_name, x_list=x_list)
+                if ecm_res is None:
+                    st.warning("ECM could not be estimated reliably (insufficient aligned observations or parsing issues).")
+                else:
+                    ecm_tab = getattr(ecm_res, "ecm_table_", pd.DataFrame())
+                    st_table(ecm_tab)
+                    try:
+                        ect_row = ecm_tab[ecm_tab["term"] == "ect_l1"].iloc[0]
+                        st.markdown(
+                            f"<div class='card'><h3>Speed of adjustment (ECT)</h3><p>ECT coefficient (expected negative if stable): <b>{ect_row['coef']:.4g}</b>, p-value: <b>{ect_row['p']:.4g}</b></p></div>",
+                            unsafe_allow_html=True,
+                        )
+                    except Exception:
+                        pass
             st.subheader("ARDL diagnostics")
             diag_rows = []
             # statsmodels ARDLResults exposes some tests in newer versions
@@ -1748,6 +2047,10 @@ else:
             except Exception:
                 fitted = None
             _plot_residual_diagnostics(resid.dropna(), fitted.dropna() if fitted is not None else None, title_prefix="ARDL")
+            try:
+                _plot_residual_acf(resid.dropna(), lags=min(24, max(6, len(resid)//3)), title_prefix="ARDL")
+            except Exception:
+                pass
 
             # Granger-style Wald tests
             st.subheader("Causality (model-consistent; Wald on ARDL terms)")
@@ -1783,20 +2086,28 @@ else:
                 "p": ardl_res.pvalues.values,
             })
 
+            ts_used = (data.reset_index().rename(columns={"index":"year"}) if hasattr(data, "reset_index") else pd.DataFrame())
+            ts_audit = _data_audit_table(df_raw, ts_df.reset_index(), context="ts", extra={"T_used": T, "transforms": str({k:v for k,v in transform_map.items() if v!="none"})})
+
             export = {
+                "ts_data_audit": ts_audit,
+                "ts_clean_head": ts_df.reset_index().head(200),
                 "ts_screening": screen_df,
                 "ts_stationarity": stat_df,
                 "ts_integration": integ_df,
                 "cointegration": pd.DataFrame(coint_rows),
                 "ardl_params": coef,
-                "ardl_long_run": lr_tbl,
-                "ecm_table": getattr(ecm_res, "ecm_table_", pd.DataFrame()) if ecm_res is not None else pd.DataFrame(),
+                "ardl_structure": struct_df,
+                "ardl_long_run": (lr_checked if lr_checked is not None else pd.DataFrame()),
+                "ecm_table": (getattr(ecm_res, "ecm_table_", pd.DataFrame()) if "ecm_res" in locals() and ecm_res is not None else pd.DataFrame()),
                 "ardl_diagnostics": pd.DataFrame(diag_rows),
                 "ardl_causality": caus_df,
             }
 
             config = {**base_config, "model": "ARDL", "Y": y_name, "X": ",".join(x_list), "max_p": str(max_p), "max_q": str(max_q), "ic": ic, "trend": trend}
             xbytes = _excel_bytes(export, notes=config)
+            st.session_state["ts_export_bytes"] = xbytes
+            st.session_state["ts_export_name"] = ("ts_report_ARDL.zip" if xbytes[:2]==b"PK" else "ts_report_ARDL.xlsx")
             is_zip = xbytes[:2] == b"PK"
 
             st.download_button(
