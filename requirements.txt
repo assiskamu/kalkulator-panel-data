@@ -3,3 +3,6 @@ pandas
 linearmodels
 statsmodels
 numpy
+matplotlib
+seaborn
+scipy
