@@ -104,7 +104,7 @@ section[data-testid="stSidebar"]{
   border-right: 1px solid rgba(140,180,255,0.18);
 }
 
-.block-container{padding-top: calc(4.25rem + env(safe-area-inset-top)); padding-bottom: 2.2rem;}
+.block-container{padding-top: 1.2rem; padding-bottom: 2.2rem;}
 
 /* Headings */
 .h-title{font-size:1.7rem; font-weight:900; margin:0 0 .25rem 0; letter-spacing:.2px;}
@@ -1085,20 +1085,48 @@ def _plot_var_irf_fevd(var_res, steps: int = 10) -> None:
 # ============================================================
 
 
-def _excel_bytes(tables: Dict[str, pd.DataFrame], notes: Optional[Dict[str, str]] = None) -> bytes:
-    """Write Excel to bytes. Try openpyxl then xlsxwriter; fallback to ZIP of CSV."""
-    # Ensure config is always present
+def _export_package(
+    tables: Dict[str, pd.DataFrame],
+    notes: Optional[Dict[str, str]] = None,
+    base_name: str = "report",
+) -> Tuple[bytes, str, str]:
+    """Create an export package.
+
+    Returns (bytes, file_name, mime).
+
+    Strategy:
+    1) Try Excel with openpyxl (if installed).
+    2) Else try Excel with xlsxwriter (if installed).
+    3) Else fallback to ZIP of CSV.
+
+    This avoids deployment crashes when an Excel engine is missing and prevents
+    users downloading a ZIP disguised as .xlsx.
+    """
+
+    # Always include config sheet/table
     if notes is not None and "config" not in tables:
         tables = dict(tables)
-        tables["config"] = pd.DataFrame([{"key": k, "value": v} for k, v in notes.items()])
+        tables["config"] = pd.DataFrame([
+            {"key": k, "value": v} for k, v in notes.items()
+        ])
 
-    bio = io.BytesIO()
-
-    engines = ["openpyxl", "xlsxwriter"]
-    last_err: Optional[Exception] = None
-
-    for eng in engines:
+    def _can_import(mod: str) -> bool:
         try:
+            __import__(mod)
+            return True
+        except Exception:
+            return False
+
+    engine_candidates: List[Tuple[str, str]] = []
+    if _can_import("openpyxl"):
+        engine_candidates.append(("openpyxl", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+    if _can_import("xlsxwriter"):
+        engine_candidates.append(("xlsxwriter", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+
+    # Attempt Excel export
+    for eng, mime in engine_candidates:
+        try:
+            bio = io.BytesIO()
             with pd.ExcelWriter(bio, engine=eng) as writer:
                 for name, df in tables.items():
                     if df is None:
@@ -1106,12 +1134,12 @@ def _excel_bytes(tables: Dict[str, pd.DataFrame], notes: Optional[Dict[str, str]
                     sheet = str(name)[:31]
                     d = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
                     d.to_excel(writer, sheet_name=sheet, index=False)
-            return bio.getvalue()
-        except Exception as e:
-            last_err = e
-            bio = io.BytesIO()
+            return bio.getvalue(), f"{base_name}.xlsx", mime
+        except Exception:
+            # try next engine
+            continue
 
-    # Fallback to ZIP of CSV
+    # Fallback: ZIP of CSV
     zbio = io.BytesIO()
     with zipfile.ZipFile(zbio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name, df in tables.items():
@@ -1119,13 +1147,17 @@ def _excel_bytes(tables: Dict[str, pd.DataFrame], notes: Optional[Dict[str, str]
                 continue
             d = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
             zf.writestr(f"{name}.csv", d.to_csv(index=False))
-    if notes is not None:
-        zf_note = pd.DataFrame([{"key": k, "value": v} for k, v in notes.items()])
-        with zipfile.ZipFile(zbio, mode="a", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("config.csv", zf_note.to_csv(index=False))
+        if notes is not None:
+            cfg = pd.DataFrame([{"key": k, "value": v} for k, v in notes.items()])
+            zf.writestr("config.csv", cfg.to_csv(index=False))
 
-    # If you reached here, Excel not possible
-    return zbio.getvalue()
+    return zbio.getvalue(), f"{base_name}.zip", "application/zip"
+
+
+def _excel_bytes(tables: Dict[str, pd.DataFrame], notes: Optional[Dict[str, str]] = None) -> bytes:
+    """Backward-compatible wrapper (bytes only). Prefer _export_package."""
+    data, _, _ = _export_package(tables, notes=notes, base_name="report")
+    return data
 
 
 # ============================================================
@@ -1229,8 +1261,8 @@ if mode == "Panel data":
             st.info("No re-estimation executed. You can download the last panel report below, or click Estimate panel models to recompute.")
             xbytes = st.session_state["panel_export_bytes"]
             name = st.session_state["panel_export_name"]
-            is_zip = xbytes[:2] == b"PK"
-            st.download_button("Download last panel report", data=xbytes, file_name=name, mime=("application/zip" if is_zip else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+            mime = st.session_state.get("panel_export_mime", "application/zip" if xbytes[:2]==b"PK" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("Download last panel report", data=xbytes, file_name=name, mime=mime)
         st.stop()
 
     df_panel, y, X, meta_prep = _panel_prepare(
@@ -1504,18 +1536,17 @@ if mode == "Panel data":
         "recommended_model": rec,
     }
 
-    xbytes = _excel_bytes(export_tables, notes=config)
+    xbytes, fname, mime = _export_package(export_tables, notes=config, base_name="panel_report")
     st.session_state["panel_export_bytes"] = xbytes
-    st.session_state["panel_export_name"] = ("panel_report.zip" if xbytes[:2]==b"PK" else "panel_report.xlsx")
-
-    # Decide mime based on whether it looks like zip
-    is_zip = xbytes[:2] == b"PK"
-
+    st.session_state["panel_export_name"] = fname
+    st.session_state["panel_export_mime"] = mime
+    if fname.endswith(".zip"):
+        st.warning("Excel engine (openpyxl/xlsxwriter) not available. Export provided as ZIP of CSV. Add openpyxl or xlsxwriter to requirements.txt to enable .xlsx export.")
     st.download_button(
         "Download panel report",
         data=xbytes,
-        file_name=("panel_report.zip" if is_zip else "panel_report.xlsx"),
-        mime=("application/zip" if is_zip else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        file_name=fname,
+        mime=mime,
     )
 
 
@@ -1657,8 +1688,8 @@ else:
                 st.info('No re-fit executed. You can download the last TS report below, or click Fit VAR to recompute.')
                 xbytes = st.session_state['ts_export_bytes']
                 name = st.session_state['ts_export_name']
-                is_zip = xbytes[:2] == b'PK'
-                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=('application/zip' if is_zip else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
+                mime = st.session_state.get('ts_export_mime', 'application/zip' if xbytes[:2]==b'PK' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=mime)
             st.stop()
 
         data = ts_df[endog].copy()
@@ -1728,16 +1759,18 @@ else:
             }
 
             config = {**base_config, "model": "VAR", "endog": ",".join(endog), "selected_lag": str(lag), "trend": trend, "ic": ic, "data_mode": data_mode}
-            xbytes = _excel_bytes(export, notes=config)
+            xbytes, fname, mime = _export_package(export, notes=config, base_name="ts_report_VAR")
             st.session_state["ts_export_bytes"] = xbytes
-            st.session_state["ts_export_name"] = ("ts_report_VAR.zip" if xbytes[:2]==b"PK" else "ts_report_VAR.xlsx")
-            is_zip = xbytes[:2] == b"PK"
+            st.session_state["ts_export_name"] = fname
+            st.session_state["ts_export_mime"] = mime
+            if fname.endswith(".zip"):
+                st.warning("Excel engine (openpyxl/xlsxwriter) not available. Export provided as ZIP of CSV. Add openpyxl or xlsxwriter to requirements.txt to enable .xlsx export.")
 
             st.download_button(
                 "Download TS report",
                 data=xbytes,
-                file_name=("ts_report_VAR.zip" if is_zip else "ts_report_VAR.xlsx"),
-                mime=("application/zip" if is_zip else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                file_name=fname,
+                mime=mime,
             )
 
         except Exception as e:
@@ -1788,8 +1821,8 @@ else:
                 st.info('No re-fit executed. You can download the last TS report below, or click Fit VECM to recompute.')
                 xbytes = st.session_state['ts_export_bytes']
                 name = st.session_state['ts_export_name']
-                is_zip = xbytes[:2] == b'PK'
-                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=('application/zip' if is_zip else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
+                mime = st.session_state.get('ts_export_mime', 'application/zip' if xbytes[:2]==b'PK' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=mime)
             st.stop()
 
         data = ts_df[endog].copy()
@@ -1894,16 +1927,18 @@ else:
             }
 
             config = {**base_config, "model": "VECM", "endog": ",".join(endog), "k_ar_diff": str(k_ar_diff), "deterministic": det, "rank": str(rank)}
-            xbytes = _excel_bytes(export, notes=config)
+            xbytes, fname, mime = _export_package(export, notes=config, base_name="ts_report_VECM")
             st.session_state["ts_export_bytes"] = xbytes
-            st.session_state["ts_export_name"] = ("ts_report_VECM.zip" if xbytes[:2]==b"PK" else "ts_report_VECM.xlsx")
-            is_zip = xbytes[:2] == b"PK"
+            st.session_state["ts_export_name"] = fname
+            st.session_state["ts_export_mime"] = mime
+            if fname.endswith(".zip"):
+                st.warning("Excel engine (openpyxl/xlsxwriter) not available. Export provided as ZIP of CSV. Add openpyxl or xlsxwriter to requirements.txt to enable .xlsx export.")
 
             st.download_button(
                 "Download TS report",
                 data=xbytes,
-                file_name=("ts_report_VECM.zip" if is_zip else "ts_report_VECM.xlsx"),
-                mime=("application/zip" if is_zip else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                file_name=fname,
+                mime=mime,
             )
 
         except Exception as e:
@@ -1935,8 +1970,8 @@ else:
                 st.info('No re-fit executed. You can download the last TS report below, or click Fit ARDL to recompute.')
                 xbytes = st.session_state['ts_export_bytes']
                 name = st.session_state['ts_export_name']
-                is_zip = xbytes[:2] == b'PK'
-                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=('application/zip' if is_zip else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
+                mime = st.session_state.get('ts_export_mime', 'application/zip' if xbytes[:2]==b'PK' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                st.download_button('Download last TS report', data=xbytes, file_name=name, mime=mime)
             st.stop()
 
         data_y = ts_df[y_name].astype(float)
@@ -2105,16 +2140,18 @@ else:
             }
 
             config = {**base_config, "model": "ARDL", "Y": y_name, "X": ",".join(x_list), "max_p": str(max_p), "max_q": str(max_q), "ic": ic, "trend": trend}
-            xbytes = _excel_bytes(export, notes=config)
+            xbytes, fname, mime = _export_package(export, notes=config, base_name="ts_report_ARDL")
             st.session_state["ts_export_bytes"] = xbytes
-            st.session_state["ts_export_name"] = ("ts_report_ARDL.zip" if xbytes[:2]==b"PK" else "ts_report_ARDL.xlsx")
-            is_zip = xbytes[:2] == b"PK"
+            st.session_state["ts_export_name"] = fname
+            st.session_state["ts_export_mime"] = mime
+            if fname.endswith(".zip"):
+                st.warning("Excel engine (openpyxl/xlsxwriter) not available. Export provided as ZIP of CSV. Add openpyxl or xlsxwriter to requirements.txt to enable .xlsx export.")
 
             st.download_button(
                 "Download TS report",
                 data=xbytes,
-                file_name=("ts_report_ARDL.zip" if is_zip else "ts_report_ARDL.xlsx"),
-                mime=("application/zip" if is_zip else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                file_name=fname,
+                mime=mime,
             )
 
         except Exception as e:
