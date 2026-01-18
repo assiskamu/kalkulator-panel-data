@@ -1236,7 +1236,7 @@ else:
             st.dataframe(unclear, use_container_width=True)
 
         try:
-            sel = ardl_select_order(data_y, data_X, maxlag=max_p, maxorder=max_q, ic=ic, trend=trend)
+            sel = ardl_select_order(data_y, max_p, data_X, max_q, ic=ic, trend=trend)
             ardl_res = sel.model.fit()
 
             st.markdown("**Selected ARDL order**")
