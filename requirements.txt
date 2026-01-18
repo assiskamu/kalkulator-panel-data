@@ -1,8 +1,8 @@
 streamlit
 pandas
+numpy
 linearmodels
 statsmodels
-numpy
 matplotlib
 seaborn
 scipy
