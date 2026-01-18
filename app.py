@@ -10,13 +10,16 @@ from scipy import stats
 st.set_page_config(page_title="Panel Data Expert System", layout="wide")
 
 st.title("🔬 Comprehensive Panel Data Analyzer")
-st.markdown("This application estimates Pooled OLS, Fixed Effects, and Random Effects models with automated diagnostic testing.")
 
-# --- FILE UPLOAD ---
+# --- 1. FILE UPLOAD ---
 uploaded_file = st.file_uploader("Upload your CSV file (Long Panel Format)", type=["csv"])
 
 if uploaded_file:
+    # AUTO-SHOW DATA IMMEDIATELY
     df = pd.read_csv(uploaded_file)
+    st.subheader("📋 Data Preview (Auto-loaded)")
+    st.dataframe(df.head(10))
+    
     cols = df.columns.tolist()
     
     with st.sidebar:
@@ -28,88 +31,75 @@ if uploaded_file:
         st.divider()
         run_btn = st.button("RUN FULL ANALYSIS")
 
+    # --- 2. VALIDATION & ANALYSIS ---
     if run_btn:
         if not x_cols:
             st.error("Please select at least one X variable.")
         else:
-            # Data Preparation
-            df_clean = df.dropna(subset=[y_col] + x_cols)
-            data = df_clean.set_index([id_col, time_col])
-            exog = sm.add_constant(data[x_cols])
-            
-            # Create Tabs for better UI
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Visualization", "📈 Model Estimation", "🔍 Selection & Diagnostics", "💊 Final Robust Model"])
+            try:
+                # Data Preparation & Duplicate Check
+                df_clean = df.dropna(subset=[id_col, time_col, y_col] + x_cols)
+                
+                # Check for duplicates in Entity-Time index
+                duplicates = df_clean.duplicated(subset=[id_col, time_col]).sum()
+                if duplicates > 0:
+                    st.error(f"Error: Found {duplicates} duplicate entries for the same Entity and Time. Please clean your data.")
+                else:
+                    data = df_clean.set_index([id_col, time_col])
+                    exog = sm.add_constant(data[x_cols])
+                    
+                    # Create Tabs
+                    tab1, tab2, tab3, tab4 = st.tabs(["📊 Visualization", "📈 Models", "🔍 Selection Tests", "💊 Robust Model"])
 
-            # --- TAB 1: VISUALIZATION ---
-            with tab1:
-                st.subheader("Entity Specific Trends")
-                fig, ax = plt.subplots(figsize=(10, 5))
-                for label, grp in df_clean.groupby(id_col):
-                    grp.sort_values(time_col).plot(x=time_col, y=y_col, ax=ax, label=label, marker='o')
-                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
-                st.pyplot(fig)
-                st.info("Visual check: If the lines have different levels/intercepts, Fixed Effects (FE) is likely necessary.")
+                    with tab1:
+                        st.subheader("Entity Trends Over Time")
+                        fig, ax = plt.subplots(figsize=(10, 5))
+                        for label, grp in df_clean.groupby(id_col):
+                            grp.sort_values(time_col).plot(x=time_col, y=y_col, ax=ax, label=label, marker='o')
+                        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+                        st.pyplot(fig)
 
-            # --- TAB 2: ESTIMATION ---
-            with tab2:
-                st.subheader("Comparison of All Models")
-                m_pooled = PooledOLS(data[y_col], exog).fit()
-                m_fe1 = PanelOLS(data[y_col], exog, entity_effects=True).fit()
-                m_fe2 = PanelOLS(data[y_col], exog, entity_effects=True, time_effects=True).fit()
-                m_re = RandomEffects(data[y_col], exog).fit()
-                
-                comparison = compare({
-                    "Pooled OLS": m_pooled, 
-                    "FE (One-way)": m_fe1, 
-                    "FE (Two-way)": m_fe2, 
-                    "Random Effects": m_re
-                })
-                st.write(comparison)
+                    with tab2:
+                        st.subheader("Model Comparison")
+                        # Estimations
+                        m_pooled = PooledOLS(data[y_col], exog).fit()
+                        m_fe1 = PanelOLS(data[y_col], exog, entity_effects=True).fit()
+                        m_fe2 = PanelOLS(data[y_col], exog, entity_effects=True, time_effects=True).fit()
+                        m_re = RandomEffects(data[y_col], exog).fit()
+                        
+                        st.write(compare({"Pooled": m_pooled, "FE (1-Way)": m_fe1, "FE (2-Way)": m_fe2, "RE": m_re}))
 
-            # --- TAB 3: DIAGNOSTICS ---
-            with tab3:
-                st.subheader("Model Selection Tests")
-                
-                # Hausman Test Implementation
-                b_fe = m_fe1.params
-                b_re = m_re.params
-                v_fe = m_fe1.cov
-                v_re = m_re.cov
-                diff = b_fe - b_re
-                precision = np.linalg.pinv(v_fe - v_re)
-                stat = diff.T @ precision @ diff
-                p_hausman = 1 - stats.chi2.cdf(stat, len(b_fe))
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**1. Hausman Test (FE vs RE)**")
-                    st.metric("P-Value", f"{p_hausman:.4f}")
-                    if p_hausman < 0.05:
-                        st.error("Decision: Use Fixed Effects (FE)")
-                        st.write("Reason: Null hypothesis rejected. Individual effects are correlated with regressors.")
-                    else:
-                        st.success("Decision: Use Random Effects (RE)")
-                        st.write("Reason: Failed to reject Null. RE is more efficient.")
+                    with tab3:
+                        st.subheader("Diagnostics & Selection")
+                        # Hausman Test
+                        b_fe = m_fe1.params
+                        b_re = m_re.params
+                        v_fe = m_fe1.cov
+                        v_re = m_re.cov
+                        diff = b_fe - b_re
+                        h_stat = diff.T @ np.linalg.pinv(v_fe - v_re) @ diff
+                        p_hausman = 1 - stats.chi2.cdf(h_stat, len(b_fe))
+                        
+                        st.markdown(f"**Hausman Test P-Value:** `{p_hausman:.4f}`")
+                        if p_hausman < 0.05:
+                            st.error("Decision: Use Fixed Effects (FE)")
+                        else:
+                            st.success("Decision: Use Random Effects (RE)")
+                            
+                        # F-test for Fixed Effects
+                        st.markdown(f"**F-test (Pooled vs FE) P-Value:** `{m_fe1.f_pooled.pval:.4f}`")
 
-                with col2:
-                    st.markdown("**2. Pooled vs FE (F-test)**")
-                    st.write(f"F-stat P-value: {m_fe1.f_pooled.pval:.4f}")
-                    if m_fe1.f_pooled.pval < 0.05:
-                        st.error("Decision: Pooled OLS is Inadequate")
-                    else:
-                        st.success("Decision: Pooled OLS is Sufficient")
+                    with tab4:
+                        st.subheader("Final Robust Results")
+                        st.info("Treatment: Clustered Standard Errors (Corrects for Heteroscedasticity & Serial Correlation)")
+                        
+                        is_fe = p_hausman < 0.05
+                        res_robust = PanelOLS(data[y_col], exog, entity_effects=is_fe).fit(cov_type='clustered', cluster_entity=True)
+                        
+                        st.text(res_robust.summary)
+                        st.download_button("Export Results", str(res_robust.summary), file_name="panel_analysis.txt")
 
-            # --- TAB 4: ROBUST TREATMENT ---
-            with tab4:
-                st.subheader("Final Model with Robust Standard Errors")
-                st.write("This model addresses **Heteroscedasticity** and **Serial Correlation** using Clustered Covariance.")
-                
-                # Automatically choose model based on Hausman
-                is_fe = p_hausman < 0.05
-                final_res = PanelOLS(data[y_col], exog, entity_effects=is_fe).fit(cov_type='clustered', cluster_entity=True)
-                
-                st.write(f"Showing results for: **{'Fixed Effects' if is_fe else 'Random Effects'} Model (Robust)**")
-                st.text(final_res.summary)
-                
-                # Download Results
-                st.download_button("Download Summary as TXT", str(final_res.summary), file_name="regression_results.txt")
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+else:
+    st.info("Please upload a CSV file to begin.")
