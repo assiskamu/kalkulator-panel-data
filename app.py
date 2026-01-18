@@ -104,7 +104,7 @@ section[data-testid="stSidebar"]{
   border-right: 1px solid rgba(140,180,255,0.18);
 }
 
-.block-container{padding-top: 1.2rem; padding-bottom: 2.2rem;}
+.block-container{padding-top: calc(4.25rem + env(safe-area-inset-top)); padding-bottom: 2.2rem;}
 
 /* Headings */
 .h-title{font-size:1.7rem; font-weight:900; margin:0 0 .25rem 0; letter-spacing:.2px;}
