@@ -79,8 +79,8 @@ def inject_css() -> None:
   --card:#101F3D;
   --card2:#0D1833;
   --border: rgba(140, 180, 255, 0.22);
-  --text:#EAF1FF;
-  --muted:#A9B5D6;
+  --text:#FFFFFF;
+  --muted:#D6E0FF;
   --accent:#00D1B2;
   --accent2:#7AA2FF;
   --accent3:#FFB703;
@@ -91,6 +91,44 @@ def inject_css() -> None:
 html, body, [class*="css"]{
   color: var(--text) !important;
 }
+
+/* Force high-contrast text for Streamlit widgets */
+[data-testid="stMarkdownContainer"] *{color: var(--text) !important;}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *{color: var(--muted) !important;}
+[data-testid="stWidgetLabel"] *{color: var(--text) !important; font-weight:700;}
+label, label *{color: var(--text) !important;}
+.stTextInput input, .stNumberInput input, .stTextArea textarea{
+  color: var(--text) !important;
+  background: rgba(255,255,255,0.04) !important;
+  border: 1px solid rgba(140,180,255,0.26) !important;
+}
+.stTextInput input::placeholder, .stNumberInput input::placeholder, .stTextArea textarea::placeholder{color: var(--muted) !important;}
+div[data-baseweb="select"] *{color: var(--text) !important;}
+div[data-baseweb="select"] > div{
+  background: rgba(255,255,255,0.04) !important;
+  border: 1px solid rgba(140,180,255,0.26) !important;
+}
+[data-testid="stMultiSelect"] *{color: var(--text) !important;}
+[data-testid="stRadio"] *{color: var(--text) !important;}
+[data-testid="stCheckbox"] *{color: var(--text) !important;}
+[data-testid="stSlider"] *{color: var(--text) !important;}
+[data-testid="stExpander"] *{color: var(--text) !important;}
+
+/* Buttons */
+.stButton button{
+  color: var(--text) !important;
+  background: linear-gradient(180deg, rgba(0,209,178,0.22), rgba(0,209,178,0.10)) !important;
+  border: 1px solid rgba(0,209,178,0.45) !important;
+}
+.stDownloadButton button{
+  color: var(--text) !important;
+  background: linear-gradient(180deg, rgba(122,162,255,0.22), rgba(122,162,255,0.10)) !important;
+  border: 1px solid rgba(122,162,255,0.45) !important;
+}
+
+/* Dataframe fallback readability */
+[data-testid="stDataFrame"] *{color: var(--text) !important;}
+
 
 /* Background */
 .stApp{
