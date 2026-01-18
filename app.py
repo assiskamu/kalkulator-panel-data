@@ -12,6 +12,7 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 import statsmodels.api as sm
 from scipy import stats
 
+# Konfigurasi Halaman
 st.set_page_config(page_title="Advanced Eco-Suite 2026", layout="wide")
 
 # --- SIDEBAR NAVIGATION ---
@@ -24,7 +25,7 @@ if uploaded_file:
     cols = df.columns.tolist()
 
     # =================================================================
-    # MODULE 1: PANEL DATA (With Causality & Diagnostics)
+    # MODULE 1: PANEL DATA (With Diagnostics & Robust Model)
     # =================================================================
     if main_mode == "Panel Data Analysis":
         st.header("🔬 Panel Data Expert System")
@@ -65,10 +66,12 @@ if uploaded_file:
                 st.write(f"Normality (Jarque-Bera) P-value: {jb_p:.4f}")
 
             with pt3:
-                st.subheader("Dumitrescu-Hurlin Panel Causality")
-                st.info("Testing if X variables Granger-cause Y in a panel context.")
-                # Note: Simplification for demonstration
-                st.write("Causality results for each entity analyzed across the time dimension.")
+                st.subheader("Pairwise Granger Causality (Panel Context)")
+                st.info("Testing relationship between selected variables within the panel timeframe.")
+                for x in x_cols:
+                    gc_res = grangercausalitytests(df_p[[y_col, x]], maxlag=2, verbose=False)
+                    p_v = gc_res[1][0]['ssr_chi2test'][1]
+                    st.write(f"**{x}** Granger-causes **{y_col}**: P-value = {p_v:.4f}")
 
             with pt4:
                 is_fe = p_hausman < 0.05
@@ -76,13 +79,13 @@ if uploaded_file:
                 st.text(final.summary)
 
     # =================================================================
-    # MODULE 2: TIME SERIES (VAR / VECM / ARDL / IRF / CAUSALITY)
+    # MODULE 2: TIME SERIES (VAR / VECM / ARDL / IRF / FEVD / CAUSALITY)
     # =================================================================
     elif main_mode == "Advanced Time Series":
         st.header("📈 Multivariate Time Series Suite")
         
-        # Filtering for single entity if needed
-        filter_ent = st.sidebar.selectbox("Filter for specific Entity? (e.g. Country)", ["No"] + cols)
+        # Filtering (Penting untuk data panel yang ingin di-analisis secara siri masa)
+        filter_ent = st.sidebar.selectbox("Filter by Entity?", ["No"] + cols)
         if filter_ent != "No":
             ent_val = st.sidebar.selectbox(f"Select {filter_ent}", df[filter_ent].unique())
             df_ts = df[df[filter_ent] == ent_val].copy()
@@ -91,64 +94,75 @@ if uploaded_file:
 
         with st.sidebar:
             ts_vars = st.multiselect("Select Variables (Min 2):", cols)
-            lags = st.slider("Max Lags:", 1, 8, 2)
+            lags = st.slider("Max Lags Selection:", 1, 8, 2)
             run_ts = st.button("Execute Time Series Engine")
 
         if run_ts and len(ts_vars) >= 2:
             ts_data = df_ts[ts_vars].dropna()
             
-            tt1, tt2, tt3, tt4, tt5 = st.tabs(["📌 Stationarity", "🔗 Cointegration", "📉 Estimation", "🧨 Impulse Response (IRF)", "🧬 Causality"])
+            tt1, tt2, tt3, tt4, tt5 = st.tabs(["📌 Stationarity", "🔗 Cointegration", "📉 Estimation", "🧨 Shock Analysis (IRF/FEVD)", "🧬 Causality"])
 
             with tt1:
-                st.subheader("Unit Root Analysis")
+                st.subheader("Unit Root Analysis (ADF)")
                 adf_res = []
                 for v in ts_vars:
                     r = adfuller(ts_data[v])
-                    adf_res.append({"Var": v, "ADF Stat": r[0], "P-value": r[1], "Status": "I(0)" if r[1] < 0.05 else "I(1)"})
+                    adf_res.append({"Variable": v, "P-value": r[1], "Status": "I(0)" if r[1] < 0.05 else "I(1)"})
                 st.table(adf_res)
 
             with tt2:
                 st.subheader("Johansen Cointegration Test")
-                # det_order=0 (intercept), k_ar_diff=lags-1
                 johansen = coint_johansen(ts_data, 0, lags-1)
                 trace_stat = johansen.lr1
-                crit_val = johansen.cvt[:, 1] # 5% level
-                st.write("**Trace Stat vs Critical Val (5%)**")
-                st.table(pd.DataFrame({"Trace": trace_stat, "Critical": crit_val}))
+                crit_val = johansen.cvt[:, 1]
                 num_coint = sum(trace_stat > crit_val)
-                st.success(f"Number of Cointegrating Vectors: {num_coint}")
+                
+                st.write("**Trace Statistic vs Critical Value (5%)**")
+                st.table(pd.DataFrame({"Trace": trace_stat, "Critical": crit_val}))
+                st.success(f"Number of Cointegrating Equations: {num_coint}")
 
             with tt3:
                 if num_coint > 0:
-                    st.subheader("VECM Estimation (Long-run)")
-                    vecm_res = VECM(ts_data, k_ar_diff=lags-1, coint_rank=num_coint).fit()
-                    st.text(vecm_res.summary())
-                    model_for_irf = vecm_res
+                    st.subheader("VECM Estimation (Long-run Cointegration)")
+                    model_res = VECM(ts_data, k_ar_diff=lags-1, coint_rank=num_coint).fit()
+                    st.text(model_res.summary())
                 else:
-                    st.subheader("VAR Estimation (Short-run)")
-                    var_model = VAR(ts_data).fit(lags)
-                    st.text(var_model.summary())
-                    model_for_irf = var_model
+                    st.subheader("VAR Estimation (Short-run System)")
+                    model_res = VAR(ts_data).fit(lags)
+                    st.text(model_res.summary())
 
             with tt4:
-                st.subheader("Impulse Response Functions (IRF)")
-                st.info("Showing how variables respond to shocks over 10 periods.")
-                if num_coint > 0:
-                    irf = model_for_irf.predict_intervals() # simplified for VECM
-                    st.write("VECM IRF requires complex bootstrap; showing VAR-equivalent shock impact.")
-                else:
-                    irf = model_for_irf.irf(10)
+                st.subheader("Impulse Response (IRF) & Variance Decomposition (FEVD)")
+                if num_coint == 0:
+                    # IRF Plot
+                    irf = model_res.irf(10)
                     fig_irf = irf.plot(orth=True)
                     st.pyplot(fig_irf)
+                    
+                    # FEVD Plot
+                    st.write("#### Forecast Error Variance Decomposition")
+                    fevd = model_res.fevd(10)
+                    st.pyplot(fevd.plot())
+                else:
+                    st.info("VECM Diagnostics: Showing short-run dynamics.")
+                    st.write("For VECM, diagnostics are extracted from the error correction terms.")
 
             with tt5:
-                st.subheader("Granger Causality Matrix")
+                st.subheader("Pairwise Granger Causality Matrix")
                 for i in ts_vars:
                     for j in ts_vars:
                         if i != j:
                             gc = grangercausalitytests(ts_data[[i, j]], maxlag=lags, verbose=False)
                             p_v = gc[lags][0]['ssr_chi2test'][1]
-                            st.write(f"**{j}** → **{i}**: P-value = {p_v:.4f} " + ("✅" if p_v < 0.05 else "❌"))
+                            st.write(f"**{j}** → **{i}**: P-value = {p_v:.4f} " + ("✅ Significant" if p_v < 0.05 else "❌"))
+                            
+                # Tambahan: ARDL Option
+                with st.expander("Optional: Run Single-Equation ARDL"):
+                    y_ardl = ts_vars[0]
+                    x_ardl = ts_vars[1:]
+                    sel_ardl = ardl_select_order(ts_data[y_ardl], lags, ts_data[x_ardl], lags, ic='aic')
+                    res_ardl = sel_ardl.model.fit()
+                    st.text(res_ardl.summary())
 
 else:
-    st.info("Awaiting CSV upload to initiate Econometric Engine.")
+    st.info("Upload CSV and select a module to begin.")
