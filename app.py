@@ -1203,7 +1203,7 @@ def _excel_bytes(tables: Dict[str, pd.DataFrame], notes: Optional[Dict[str, str]
 # ============================================================
 
 st.markdown("<div class='h-title'>Academic Econometrics Suite</div>", unsafe_allow_html=True)
-st.markdown("<div class='h-sub'>Panel (Pooled/FE/RE/CRE) + Annual Time Series (VAR/VECM/ARDL) — with validation, diagnostics, and audit-ready export.</div>", unsafe_allow_html=True)
+st.markdown("<div class='h-sub'>By Assis Kamu UMS</div>", unsafe_allow_html=True)
 
 mode = st.sidebar.radio("Module", ["Panel data", "Time series (separate file)"], index=0)
 
